@@ -1,0 +1,55 @@
+name: Discord to Telegram alerts
+
+on:
+  schedule:
+    # Every 5 minutes is the fastest GitHub cron allows. Real firings are
+    # often a few minutes late when the runner fleet is busy; that is normal.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print alerts instead of sending them"
+        type: boolean
+        default: false
+
+concurrency:
+  # Never let two runs poll at once, or the same message can alert twice.
+  group: discord-telegram-relay
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Poll Discord and push to Telegram
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+        run: python watcher.py
+
+      - name: Save position
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name  "discord-telegram-relay"
+            git config user.email "actions@github.com"
+            git add state.json
+            git commit -m "chore: update relay position [skip ci]"
+            # Another run may have pushed while this one polled.
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          else
+            echo "no new messages, nothing to save"
+          fi
