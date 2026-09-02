@@ -23,18 +23,19 @@ The Discord application already exists.
 * Application ID: `1544633846132383784`
 * Message Content Intent: **on**. Presence and Server Members intents: off,
   the relay does not need them.
+* Repo: https://github.com/ShivamFractionAI/discord-telegram-alerts
 * Invite link, ready to hand an admin:
   `https://discord.com/oauth2/authorize?client_id=1544633846132383784&scope=bot&permissions=66560`
 
-Still to do: get the bot token into a GitHub secret, create the Telegram bot,
-create the repo. All three are in Setup below.
+Still to do: create the Telegram bot, and put the three tokens into GitHub
+secrets. Both are in Setup below.
 
 ## Before you start
 
 This needs one yes from someone with Manage Server on the Fraction AI
 Discord. `ADMIN-REQUEST.md` is written for them: it lists the two permissions,
 what the bot provably cannot do, and how to revoke it. Send them that file or
-the repo link.
+the repo link below.
 
 A message that works:
 
@@ -44,8 +45,11 @@ A message that works:
 >
 > Permissions: View Channels and Read Message History, in `app-issues`,
 > `dev-rel`, `mods-chat` and `general` only. No Send Messages, no Manage anything, it
-> never writes to the server. Code and a full permission breakdown here:
-> [repo link]
+> never writes to the server. Invite link:
+> https://discord.com/oauth2/authorize?client_id=1544633846132383784&scope=bot&permissions=66560
+>
+> Code and a full permission breakdown:
+> https://github.com/ShivamFractionAI/discord-telegram-alerts
 >
 > Happy to scope it to just `app-issues` if that is easier.
 
@@ -125,19 +129,17 @@ Three accounts to wire together. Budget about 10 minutes.
    level deny beats a server level allow, so without this the run logs
    `Missing Access` for that channel and carries on with the others.
 
-### 3. GitHub repo (3 minutes)
+### 3. GitHub repo
 
-1. Create a **public** repo. Public matters: public repos get unlimited free
-   Actions minutes, private ones get 2000 per month and a 5 minute cron
-   burns roughly 8000. Nothing secret lives in the repo, the tokens go in
-   encrypted secrets. If you would rather keep it private, raise the cron to
-   every 20 minutes or move the relay to Cloudflare Workers.
-2. Commit these files, keeping the `.github/workflows/` path intact.
+1. ~~Create a public repo and commit these files.~~ Done:
+   <https://github.com/ShivamFractionAI/discord-telegram-alerts>
+2. ~~Set workflow permissions to read and write~~ so the run can save its
+   bookmark. Done.
 3. **Settings > Secrets and variables > Actions > New repository secret**,
    three times: `DISCORD_BOT_TOKEN`, `TELEGRAM_BOT_TOKEN`,
-   `TELEGRAM_CHAT_ID`.
-4. **Settings > Actions > General > Workflow permissions**, choose **Read
-   and write permissions** so the run can save its bookmark.
+   `TELEGRAM_CHAT_ID`. This step is yours: tokens should go straight from
+   where they are issued into the secret, without a detour through a chat
+   window or a notes app.
 
 ### 4. First run
 
