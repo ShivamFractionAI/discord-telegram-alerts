@@ -23,12 +23,13 @@ The Discord application already exists.
 * Application ID: `1544633846132383784`
 * Message Content Intent: **on**. Presence and Server Members intents: off,
   the relay does not need them.
+* Telegram bot: **@FractionSupportRelayBot**
 * Repo: https://github.com/ShivamFractionAI/discord-telegram-alerts
 * Invite link, ready to hand an admin:
   `https://discord.com/oauth2/authorize?client_id=1544633846132383784&scope=bot&permissions=66560`
 
-Still to do: create the Telegram bot, and put the three tokens into GitHub
-secrets. Both are in Setup below.
+Both bots exist and the repo is live. Still to do: rotate the Telegram token,
+press START on the bot, and put the three values into GitHub secrets.
 
 ## Before you start
 
@@ -89,15 +90,16 @@ last message seen per channel.
 
 Three accounts to wire together. Budget about 10 minutes.
 
-### 1. Telegram bot (2 minutes)
+### 1. Telegram bot
 
-1. In Telegram, message **@BotFather**, send `/newbot`, pick any display
-   name and a username ending in `bot`. Copy the token it gives you, this is
-   `TELEGRAM_BOT_TOKEN`.
-2. Open a chat with your new bot and send it any message. Telegram bots
-   cannot start a conversation with you, so this handshake is required or
-   your alerts will silently go nowhere.
-3. Get your chat id: open
+1. ~~Create the bot.~~ Done: **@FractionSupportRelayBot**.
+2. In BotFather send `/revoke`, pick that bot, and take the fresh token it
+   gives you. This is `TELEGRAM_BOT_TOKEN`. Rotating is worth doing because
+   the original token was displayed on screen during setup.
+3. Open <https://t.me/FractionSupportRelayBot> and press **START**. Telegram
+   bots cannot open a conversation with you, so without this handshake your
+   alerts go nowhere and nothing warns you.
+4. Get your chat id: open
    `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates` in a browser and
    look for `"chat":{"id":123456789`. That number is `TELEGRAM_CHAT_ID`.
 
