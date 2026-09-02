@@ -286,7 +286,26 @@ def run(config, state, discord, telegram_token, chat_id, dry_run=False):
     global_keywords = config.get("keywords", [])
     watch_ids = set(str(i) for i in config.get("watch_mention_ids", []))
 
-    all_channels = discord.guild_channels(guild_id)
+    try:
+        all_channels = discord.guild_channels(guild_id)
+    except HttpError as exc:
+        if exc.status == 401:
+            # A bad or revoked token is a real failure. Fail loudly so the run
+            # goes red and you actually notice.
+            log("Discord rejected the bot token (401). Reset it in the")
+            log("developer portal and update the DISCORD_BOT_TOKEN secret.")
+            raise
+        if exc.status in (403, 404):
+            # The bot is not in the server yet, or has been removed. This is a
+            # normal waiting state, not a crash: exit clean so the run stays
+            # green and the log says plainly what is missing.
+            log(f"cannot read guild {guild_id}: {exc}")
+            log("The bot is not in the server yet, or it lost View Channels.")
+            log("Ask an admin to authorise the invite link, then this run")
+            log("will start picking up channels on its own. Nothing to fix here.")
+            return state, 0
+        raise
+
     resolved, missing = resolve_channels(all_channels, list(channels_cfg.keys()))
     for name in missing:
         log(f"WARNING: channel '{name}' not found or bot cannot see it")

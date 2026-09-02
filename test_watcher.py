@@ -201,6 +201,39 @@ class RunTests(unittest.TestCase):
         state, count = self.go([msg(1, "bug")], {"last_message_id": {"dev-rel": "0"}})
         self.assertEqual(count, 1)
 
+    def test_bot_not_in_guild_exits_clean(self):
+        """403 on the guild means the bot is not added yet, not a crash."""
+        api = FakeDiscord(self.channels, {})
+
+        def denied(guild_id):
+            raise watcher.HttpError(403, '{"message": "Missing Access", "code": 50001}')
+
+        api.guild_channels = denied
+        state, count = watcher.run(self.config, {}, api, "tg", "chat")
+        self.assertEqual(count, 0)
+        self.assertEqual(self.sent, [])
+
+    def test_guild_not_found_exits_clean(self):
+        api = FakeDiscord(self.channels, {})
+
+        def missing(guild_id):
+            raise watcher.HttpError(404, '{"message": "Unknown Guild"}')
+
+        api.guild_channels = missing
+        state, count = watcher.run(self.config, {}, api, "tg", "chat")
+        self.assertEqual(count, 0)
+
+    def test_bad_token_still_fails_loudly(self):
+        """A revoked token must go red, not hide behind a green run."""
+        api = FakeDiscord(self.channels, {})
+
+        def unauthorized(guild_id):
+            raise watcher.HttpError(401, '{"message": "401: Unauthorized"}')
+
+        api.guild_channels = unauthorized
+        with self.assertRaises(watcher.HttpError):
+            watcher.run(self.config, {}, api, "tg", "chat")
+
     def test_unreadable_channel_is_skipped(self):
         api = FakeDiscord(self.channels, {})
 
