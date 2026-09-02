@@ -1,0 +1,52 @@
+{
+  "guild_id": "1226860543529451561",
+  "keywords": [
+    "bug",
+    "bugs",
+    "error",
+    "errors",
+    "broken",
+    "not working",
+    "doesn't work",
+    "does not work",
+    "cant",
+    "can't",
+    "cannot",
+    "stuck",
+    "failed",
+    "failing",
+    "issue",
+    "issues",
+    "crash",
+    "crashed",
+    "down",
+    "outage",
+    "urgent",
+    "help",
+    "problem",
+    "wrong",
+    "stopped",
+    "not loading",
+    "timeout",
+    "rejected",
+    "reverted",
+    "scam",
+    "hacked",
+    "exploit"
+  ],
+  "watch_mention_ids": [],
+  "channels": {
+    "app-issues": {
+      "mode": "all"
+    },
+    "dev-rel": {
+      "mode": "keywords"
+    },
+    "mods-chat": {
+      "mode": "all"
+    },
+    "general": {
+      "mode": "keywords"
+    }
+  }
+}
