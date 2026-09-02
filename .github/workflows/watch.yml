@@ -17,39 +17,72 @@ concurrency:
   group: discord-telegram-relay
   cancel-in-progress: false
 
-permissions:
-  contents: write
-
 jobs:
   relay:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Generous enough that a rate-limited send can finish rather than being
+    # killed mid-flight, which would replay alerts on the next run.
+    timeout-minutes: 10
+
+    # Scoped to this job rather than the whole workflow, so nothing else
+    # inherits write access to the repo.
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      # Pinned to a commit rather than the mutable v4 tag. A repointed tag
+      # would otherwise run arbitrary code in a job holding a write-scoped
+      # token and three secrets.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          python-version: "3.11"
+          # Needed so the save step can fetch and reset against the branch.
+          fetch-depth: 0
 
+      # ubuntu-latest already ships Python 3, and watcher.py is standard
+      # library only, so there is no setup action and no dependency to trust.
       - name: Poll Discord and push to Telegram
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
-        run: python watcher.py
+        run: python3 watcher.py
 
+      # if: always() is the important part. If this step is skipped when the
+      # relay errors, the cursor is never committed, and every following run
+      # re-polls and re-sends the same messages forever.
       - name: Save position
+        if: always()
         run: |
-          if [[ -n "$(git status --porcelain state.json)" ]]; then
-            git config user.name  "discord-telegram-relay"
-            git config user.email "actions@github.com"
-            git add state.json
-            git commit -m "chore: update relay position [skip ci]"
-            # Another run may have pushed while this one polled.
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-          else
+          set -u
+          if [[ -z "$(git status --porcelain state.json)" ]]; then
             echo "no new messages, nothing to save"
+            exit 0
           fi
+
+          git config user.name  "discord-telegram-relay"
+          git config user.email "actions@github.com"
+          git add state.json
+          git commit -m "chore: update relay position [skip ci]"
+
+          # The cursor only ever moves forward and runs are serialised by the
+          # concurrency group, so on a race our copy is the newer one. Rebuild
+          # the commit on top of the remote rather than rebasing, which can
+          # conflict on the same lines and leave the position unsaved.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "position saved"
+              exit 0
+            fi
+            echo "push rejected, rebuilding on the current remote (attempt $attempt)"
+            cp state.json "${RUNNER_TEMP}/state.json"
+            git fetch origin "${GITHUB_REF_NAME}"
+            git reset --hard "origin/${GITHUB_REF_NAME}"
+            cp "${RUNNER_TEMP}/state.json" state.json
+            git add state.json
+            git commit -m "chore: update relay position [skip ci]" || true
+            sleep 3
+          done
+
+          echo "::error::could not save the relay position after 3 attempts"
+          exit 1
