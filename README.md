@@ -75,6 +75,48 @@ Public is the recommended setup. Nothing sensitive lives in the repo: the
 tokens are in encrypted secrets, and the only committed state is the id of the
 last message seen per channel.
 
+## Security posture
+
+The bot is read-only in Discord (View Channels, Read Message History) and the
+code contains no Discord write calls, so `grep -n "POST\|PATCH\|DELETE" watcher.py`
+turns up only the Telegram send. Beyond that, the parts worth knowing about,
+because message content is attacker-controlled the moment this watches a
+public server:
+
+* **Relayed text cannot break the alert.** Content is HTML-escaped and wrapped
+  in a `<code>` span, so a hostile post cannot inject markup or smuggle a
+  tappable phishing link into a message that looks like trusted tooling. The
+  "open in Discord" anchor is the only clickable thing in an alert.
+* **Length is clamped after escaping, not before.** Escaping expands text: one
+  apostrophe becomes six characters, so 900 apostrophes become a 5535 byte
+  payload and Telegram rejects it with a 400. Truncating the raw text first
+  looks right and is not. The formatter shrinks content until the escaped
+  result actually fits.
+* **One bad message cannot wedge the relay.** Per message send failures are
+  logged and skipped; only account level failures (bad token, blocked bot)
+  stop the run. Without this, a single crafted post could make every run die
+  at the same message forever.
+* **The cursor only moves past a message once that message is dealt with.**
+  Advancing it before delivery loses anything whose send fails.
+* **The per-run cap is per channel, and over-cap messages are deferred, not
+  dropped.** A global cap lets a burst in one busy channel starve every other
+  channel silently.
+* **The Telegram token never reaches a log.** It lives in the request URL, so
+  every log line is passed through a redactor rather than relying on GitHub's
+  best-effort secret masking.
+* **`actions/checkout` is pinned to a commit**, not the mutable `v4` tag, and
+  `contents: write` is scoped to the job. There is no `setup-python` action:
+  the runner already has Python and the script is standard library only, so
+  there is one less dependency to trust.
+* **The position is saved with `if: always()`** and pushed with a retry that
+  rebuilds on the current remote. If saving is skipped when the relay errors,
+  the next run replays everything.
+* **`state.json` is written atomically** and a truncated file is tolerated, so
+  a job killed mid-write cannot cause a permanent crash loop.
+
+`python3 test_watcher.py` runs 40 offline tests, including a regression test
+for each of the above.
+
 ## Files
 
 | File | What it is |
@@ -83,7 +125,7 @@ last message seen per channel.
 | `config.json` | Which channels, which keywords, which mentions. Edit this. |
 | `state.json` | The bookmark. The workflow writes it, you never touch it. |
 | `.github/workflows/watch.yml` | The 5 minute schedule. |
-| `test_watcher.py` | Offline tests. `python3 test_watcher.py`, no tokens needed. |
+| `test_watcher.py` | 40 offline tests. `python3 test_watcher.py`, no tokens needed. |
 | `ADMIN-REQUEST.md` | The permission breakdown to hand a server admin. |
 
 ## Setup
@@ -200,7 +242,7 @@ then right click your name and Copy User ID.
 ## Testing without spamming yourself
 
 ```bash
-python3 test_watcher.py          # 27 offline tests, no tokens, no network
+python3 test_watcher.py          # 40 offline tests, no tokens, no network
 DRY_RUN=1 DISCORD_BOT_TOKEN=... TELEGRAM_BOT_TOKEN=x TELEGRAM_CHAT_ID=x \
   python3 watcher.py             # polls Discord for real, prints instead of sending
 ```
@@ -220,8 +262,9 @@ The workflow also has a `dry_run` checkbox on manual runs.
   messages, so an issue reported by editing an old message will not fire.
 * **Threads and forum posts are separate channels.** Add the thread by name
   if you need it watched.
-* **25 alerts per run is the ceiling.** Beyond that you get one "plus N
-  more" line, which keeps a raid or a spam wave from flooding your phone and
-  tripping Telegram's flood limits.
+* **12 alerts per channel per run is the ceiling.** Anything over it is
+  deferred to the next run rather than dropped, so a raid slows delivery
+  instead of losing messages. Sends are paced about a second apart to stay
+  inside Telegram's per-chat rate limit.
 * **Never commit the tokens.** They belong in GitHub secrets. If one leaks,
   reset it in the Discord developer portal or via `/revoke` in BotFather.

@@ -34,9 +34,23 @@ TELEGRAM_API = "https://api.telegram.org"
 
 USER_AGENT = "DiscordTelegramAlerts/1.0 (+https://github.com)"
 
-# Hard ceiling so a burst in a busy channel cannot flood Telegram or trip its
-# flood limits. Anything beyond this is collapsed into a single summary line.
-MAX_ALERTS_PER_RUN = 25
+# Per channel, per run. Applied PER CHANNEL rather than globally so a burst in
+# one busy channel cannot starve the others: anything over the cap is deferred
+# to the next run rather than dropped, and the channel's cursor stays put.
+MAX_ALERTS_PER_CHANNEL = 12
+
+# Telegram allows about 1 message per second per chat. Going faster reliably
+# earns a 429, and the retry waits then blow the job timeout.
+SEND_INTERVAL_SECONDS = 1.1
+
+# Stop sending after this long and defer the rest, so the job always finishes
+# well inside its timeout and always gets to save its position.
+SEND_BUDGET_SECONDS = 150
+
+# Telegram's hard cap is 4096 characters. Leave room: html.escape expands
+# text (one apostrophe becomes six characters), so the escaped payload can be
+# many times the length of the raw message.
+SAFE_TEXT_LIMIT = 3800
 
 # Discord returns at most 100 messages per request.
 MESSAGE_PAGE_LIMIT = 100
@@ -79,7 +93,7 @@ def request_with_retry(method, url, headers=None, payload=None, attempts=4):
                 wait = _retry_after(exc)
                 if last:
                     raise
-                log(f"rate limited on {url}, waiting {wait:.1f}s")
+                log(f"rate limited on {redact(url)}, waiting {wait:.1f}s")
                 time.sleep(wait)
                 continue
             if 500 <= exc.status < 600 and not last:
@@ -108,8 +122,18 @@ def _retry_after(exc: HttpError) -> float:
     return 5.0
 
 
+def redact(text: str) -> str:
+    """Strip a Telegram bot token out of anything before it reaches a log.
+
+    The token lives in the Telegram URL path, so any log line mentioning a
+    URL would otherwise print it. GitHub masks secrets in logs on a
+    best-effort basis; that is not something to depend on in a public repo.
+    """
+    return re.sub(r"/bot[^/\s]+/", "/bot***/", text)
+
+
 def log(message: str) -> None:
-    print(f"[relay] {message}", flush=True)
+    print(f"[relay] {redact(message)}", flush=True)
 
 
 # ---------------------------------------------------------------- config/state
@@ -121,13 +145,24 @@ def load_json(path, default):
         text = handle.read().strip()
     if not text:
         return default
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except ValueError:
+        # A run killed mid-write leaves truncated JSON. Starting from the
+        # default re-baselines rather than crash-looping forever.
+        log(f"{path} is not valid JSON, starting from a clean state")
+        return default
 
 
 def save_json(path, value):
-    with open(path, "w", encoding="utf-8") as handle:
+    """Write atomically so a killed job cannot leave a half-written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 # ------------------------------------------------------------------- discord
@@ -159,25 +194,38 @@ def resolve_channels(all_channels, wanted_names):
     fall back to a suffix match.
     """
     by_norm = {}
+    collisions = set()
     for channel in all_channels:
         # 0 = text, 5 = announcement, 15 = forum. Others have no messages.
         if channel.get("type") not in (0, 5, 15):
             continue
-        by_norm.setdefault(normalise(channel.get("name", "")), channel)
+        key = normalise(channel.get("name", ""))
+        if key in by_norm:
+            # Two channels normalise to the same name. Picking one by API
+            # order would silently watch the wrong channel, so refuse both.
+            collisions.add(key)
+        by_norm.setdefault(key, channel)
 
     resolved = {}
     missing = []
+    ambiguous = []
     for name in wanted_names:
         key = normalise(name)
+        if key in collisions:
+            ambiguous.append(name)
+            continue
         match = by_norm.get(key)
         if match is None:
-            candidates = [c for k, c in by_norm.items() if k.endswith(key) or key in k]
+            # Only accept a fuzzy match when exactly one candidate exists,
+            # and require it to be a suffix so "general" cannot bind to
+            # "general-off-topic".
+            candidates = [c for k, c in by_norm.items() if k.endswith(key)]
             match = candidates[0] if len(candidates) == 1 else None
         if match is None:
             missing.append(name)
         else:
             resolved[name] = match
-    return resolved, missing
+    return resolved, missing, ambiguous
 
 
 def normalise(name: str) -> str:
@@ -229,9 +277,48 @@ def message_matches(message, channel_cfg, watch_ids, keyword_re):
 
 # ------------------------------------------------------------------ telegram
 
-def format_alert(message, channel_name, guild_id, reason):
+
+class FatalTelegramError(Exception):
+    """Telegram refuses everything: bad token, blocked bot, wrong chat id.
+
+    Systemic, so it should fail the run loudly rather than be swallowed
+    per message.
+    """
+
+
+def _alert_body(message, channel_name, guild_id, reason, content):
+    """Build the HTML and plain-text forms of one alert."""
     author = message.get("author", {})
     name = author.get("global_name") or author.get("username") or "unknown"
+
+    link = (
+        f"https://discord.com/channels/{guild_id}/"
+        f"{message.get('channel_id')}/{message.get('id')}"
+    )
+
+    # The relayed text goes inside <code>. Telegram does not auto-link URLs
+    # inside a code span, so a hostile post cannot put a tappable phishing
+    # link into an alert that otherwise looks like trusted tooling output.
+    # The "open in Discord" anchor stays the only clickable thing.
+    html_text = (
+        f"<b>#{html.escape(channel_name)}</b> "
+        f"<i>{html.escape(reason)}</i>\n"
+        f"<b>{html.escape(name)}</b>: <code>{html.escape(content)}</code>\n"
+        f'<a href="{html.escape(link)}">open in Discord</a>'
+    )
+    plain_text = f"#{channel_name} ({reason})\n{name}: {content}\n{link}"
+    return html_text, plain_text
+
+
+def format_alert(message, channel_name, guild_id, reason):
+    """Render an alert that is guaranteed to fit inside Telegram's limit.
+
+    Escaping expands text: one apostrophe becomes six characters. Truncating
+    the raw content to a fixed length and escaping afterwards can therefore
+    still produce a payload well over Telegram's 4096 character cap, which
+    Telegram rejects with a 400. So shrink the raw content until the escaped
+    result actually fits, rather than assuming it will.
+    """
     content = (message.get("content") or "").strip()
 
     if not content:
@@ -247,35 +334,61 @@ def format_alert(message, channel_name, guild_id, reason):
     if len(content) > 900:
         content = content[:900].rstrip() + " ..."
 
-    link = (
-        f"https://discord.com/channels/{guild_id}/"
-        f"{message.get('channel_id')}/{message.get('id')}"
-    )
+    html_text, plain_text = _alert_body(message, channel_name, guild_id, reason, content)
+    while len(html_text) > SAFE_TEXT_LIMIT and len(content) > 24:
+        content = content[: max(24, int(len(content) * 0.6))].rstrip() + " ..."
+        html_text, plain_text = _alert_body(
+            message, channel_name, guild_id, reason, content
+        )
 
-    return (
-        f"<b>#{html.escape(channel_name)}</b> "
-        f"<i>{html.escape(reason)}</i>\n"
-        f"<b>{html.escape(name)}</b>: {html.escape(content)}\n"
-        f'<a href="{html.escape(link)}">open in Discord</a>'
-    )
+    return {"html": html_text, "plain": plain_text[:SAFE_TEXT_LIMIT]}
 
 
-def send_telegram(token, chat_id, text, dry_run=False):
+def _post_telegram(token, chat_id, payload):
+    url = f"{TELEGRAM_API}/bot{token}/sendMessage"
+    body = {"chat_id": chat_id, "disable_web_page_preview": True}
+    body.update(payload)
+    return request_with_retry("POST", url, payload=body, attempts=3)
+
+
+def send_telegram(token, chat_id, alert, dry_run=False):
+    """Deliver one alert. Returns True if it landed.
+
+    A single undeliverable message must never stop the queue or wedge the
+    relay: without this, one crafted post in a public channel could make
+    every run die at the same message forever. So per message errors are
+    logged and skipped, and only account level failures are raised.
+    """
+    if isinstance(alert, str):
+        alert = {"html": alert, "plain": alert}
+
     if dry_run:
         print("---- would send ----")
-        print(text)
-        return
-    url = f"{TELEGRAM_API}/bot{token}/sendMessage"
-    request_with_retry(
-        "POST",
-        url,
-        payload={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-    )
+        print(alert["html"])
+        return True
+
+    try:
+        _post_telegram(token, chat_id, {"text": alert["html"], "parse_mode": "HTML"})
+        return True
+    except HttpError as exc:
+        if exc.status in (401, 403, 404):
+            raise FatalTelegramError(
+                f"Telegram rejected the account or chat ({exc.status}). "
+                "Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, and that you "
+                "have not blocked the bot."
+            ) from None
+        log(f"Telegram refused the formatted alert ({exc.status}), retrying as plain text")
+
+    try:
+        _post_telegram(token, chat_id, {"text": alert["plain"]})
+        return True
+    except HttpError as exc:
+        if exc.status in (401, 403, 404):
+            raise FatalTelegramError(
+                f"Telegram rejected the account or chat ({exc.status})."
+            ) from None
+        log(f"dropping one undeliverable alert ({exc.status})")
+        return False
 
 
 # ----------------------------------------------------------------------- main
@@ -296,9 +409,9 @@ def run(config, state, discord, telegram_token, chat_id, dry_run=False):
             log("developer portal and update the DISCORD_BOT_TOKEN secret.")
             raise
         if exc.status in (403, 404):
-            # The bot is not in the server yet, or has been removed. This is a
-            # normal waiting state, not a crash: exit clean so the run stays
-            # green and the log says plainly what is missing.
+            # The bot is not in the server yet, or has been removed. A normal
+            # waiting state, not a crash: exit clean so the run stays green
+            # and the log says plainly what is missing.
             log(f"cannot read guild {guild_id}: {exc}")
             log("The bot is not in the server yet, or it lost View Channels.")
             log("Ask an admin to authorise the invite link, then this run")
@@ -306,12 +419,18 @@ def run(config, state, discord, telegram_token, chat_id, dry_run=False):
             return state, 0
         raise
 
-    resolved, missing = resolve_channels(all_channels, list(channels_cfg.keys()))
+    resolved, missing, ambiguous = resolve_channels(
+        all_channels, list(channels_cfg.keys())
+    )
     for name in missing:
         log(f"WARNING: channel '{name}' not found or bot cannot see it")
+    for name in ambiguous:
+        log(f"WARNING: '{name}' matches more than one channel, skipping it")
+        log("Use the exact name from --list-channels to disambiguate.")
 
-    alerts = []
     seen = state.setdefault("last_message_id", {})
+    deadline = time.monotonic() + SEND_BUDGET_SECONDS
+    sent_total = 0
 
     for name, channel in resolved.items():
         channel_cfg = channels_cfg[name] or {}
@@ -325,50 +444,58 @@ def run(config, state, discord, telegram_token, chat_id, dry_run=False):
             log(f"could not read #{name}: {exc}")
             continue
 
-        if not messages:
-            continue
-
         # First time we see a channel: record the position, do not replay the
         # backlog into Telegram.
         if after is None:
-            seen[name] = messages[-1]["id"]
-            log(f"#{name}: first run, baseline set at message {seen[name]}")
+            baseline = messages[-1]["id"] if messages else channel.get("last_message_id")
+            if baseline:
+                seen[name] = str(baseline)
+                log(f"#{name}: first run, baseline set at message {baseline}")
+            else:
+                log(f"#{name}: first run, channel is empty, nothing to baseline")
             continue
 
-        seen[name] = messages[-1]["id"]
+        if not messages:
+            continue
 
+        # The cursor only ever moves past a message once that message has
+        # been dealt with. Advancing it up front (the obvious way to write
+        # this) silently loses every message whose delivery then fails.
+        alerts_here = 0
+        handled = 0
         for message in messages:
+            if alerts_here >= MAX_ALERTS_PER_CHANNEL:
+                log(f"#{name}: hit the per-run cap, deferring the rest")
+                break
+            if time.monotonic() > deadline:
+                log(f"#{name}: out of send budget, deferring the rest")
+                break
+
             reason = message_matches(message, channel_cfg, watch_ids, keyword_re)
             if reason:
-                alerts.append((message, name, reason))
+                alert = format_alert(message, name, guild_id, reason)
+                if send_telegram(telegram_token, chat_id, alert, dry_run=dry_run):
+                    sent_total += 1
+                alerts_here += 1
+                if not dry_run:
+                    time.sleep(SEND_INTERVAL_SECONDS)
 
-        log(f"#{name}: {len(messages)} new message(s)")
+            handled += 1
+            # Persist progress per message, so an exception later in the run
+            # cannot re-deliver what already went out.
+            seen[name] = message["id"]
 
-    if not alerts:
-        log("no alerts this run")
-        return state, 0
-
-    overflow = 0
-    if len(alerts) > MAX_ALERTS_PER_RUN:
-        overflow = len(alerts) - MAX_ALERTS_PER_RUN
-        alerts = alerts[:MAX_ALERTS_PER_RUN]
-
-    for message, channel_name, reason in alerts:
-        text = format_alert(message, channel_name, guild_id, reason)
-        send_telegram(telegram_token, chat_id, text, dry_run=dry_run)
-        time.sleep(0.05)
-
-    if overflow:
-        send_telegram(
-            telegram_token,
-            chat_id,
-            f"<i>plus {overflow} more matching message(s) this cycle, "
-            f"check Discord</i>",
-            dry_run=dry_run,
+        deferred = len(messages) - handled
+        log(
+            f"#{name}: {handled} message(s) processed, {alerts_here} alerted"
+            + (f", {deferred} deferred to the next run" if deferred else "")
         )
 
-    log(f"sent {len(alerts)} alert(s)")
-    return state, len(alerts)
+    if not sent_total:
+        log("no alerts this run")
+    else:
+        log(f"sent {sent_total} alert(s)")
+    return state, sent_total
 
 
 def list_channels(discord, guild_id):
@@ -418,6 +545,7 @@ def main():
 
     state = load_json(state_path, {})
 
+    exit_code = 0
     try:
         state, _ = run(
             config,
@@ -427,12 +555,16 @@ def main():
             chat_id,
             dry_run=dry_run,
         )
+    except FatalTelegramError as exc:
+        log(str(exc))
+        exit_code = 1
     finally:
-        # Always persist progress, even if a later channel blew up, so a
-        # failure cannot cause the same messages to alert twice.
+        # Always persist progress, even if the run blew up partway, so the
+        # messages already delivered are not delivered again. The workflow
+        # commits this file with if: always() for the same reason.
         save_json(state_path, state)
 
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
